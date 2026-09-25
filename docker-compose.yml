@@ -12,6 +12,7 @@ services:
     volumes:
       - cyber_agent_data:/data
       - /var/run/docker.sock:/var/run/docker.sock
+      - /home/skynet/backup-to-shield.log:/backup-log/backup-to-shield.log:ro
     group_add:
       - "988"
     networks:
