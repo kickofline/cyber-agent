@@ -1,0 +1,26 @@
+name: cyber-agent
+services:
+  cyber-agent:
+    build: .
+    container_name: cyber-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - LITELLM_BASE_URL=http://litellm:4000/v1
+      - DB_PATH=/data/history.db
+    volumes:
+      - cyber_agent_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "988"
+    networks:
+      - llm-internal
+
+volumes:
+  cyber_agent_data:
+
+networks:
+  llm-internal:
+    external: true
+    name: llm-stack_llm-internal
