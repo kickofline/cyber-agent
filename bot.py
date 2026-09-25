@@ -11,6 +11,8 @@ hostname needed.
 import json
 import logging
 import os
+import re
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -20,6 +22,7 @@ import time
 
 import discord
 import docker as docker_sdk
+import psycopg2
 from discord.ext import tasks
 import requests
 from openai import OpenAI
@@ -48,14 +51,18 @@ CERT_HOSTS = os.environ.get(
     "auth.skynet.drewdettmer.com,chat.skynet.drewdettmer.com,ouachitacyber.com",
 ).split(",")
 
+LITELLM_DB_PASSWORD = os.environ.get("LITELLM_DB_PASSWORD", "")
+
 SYSTEM_PROMPT = (
     "You are cyber-agent, an infra assistant for the Ouachita Cyber / skynet LLM lab. "
     "You run inside a Discord DM. Keep replies short and plain text (no markdown tables). "
-    "Read-only tools: docker_status, docker_logs, gpu_status, backup_status, cert_expiry, "
-    "disk_usage, unifi_clients, unifi_network_health. "
-    "Mutating tools (propose_restart, propose_swap_gpu_config) never execute immediately -- "
-    "they ask the user to confirm, and only a literal 'yes' reply executes them. Do not claim "
-    "an action succeeded until you have tool output showing it did. "
+    "Read-only tools: docker_status, docker_logs, container_stats, gpu_status, backup_status, "
+    "cert_expiry, disk_usage, uptime_report, token_usage, unifi_clients, unifi_network_health, "
+    "unifi_topology, unifi_alerts. "
+    "Mutating tools (propose_restart, propose_swap_gpu_config, propose_run_shell) never execute "
+    "immediately -- calling one shows the user a Discord Confirm/Cancel button prompt, and only "
+    "clicking Confirm executes it. Do not claim an action succeeded until you have tool output "
+    "showing it did, and never tell the user to type 'yes' -- the buttons handle that. "
     "GPU note: only one of {qwen3-coder-next} or {qwen3-vl-8b + qwen3-8b-ablated} runs at a "
     "time on this box -- if a model call fails, that GPU config may be inactive right now; "
     "use gpu_status to check, and propose_swap_gpu_config (with confirmation) to change it."
@@ -83,6 +90,12 @@ def db():
         "description TEXT NOT NULL, "
         "first_seen REAL NOT NULL, "
         "last_seen REAL NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS service_checks ("
+        "service TEXT NOT NULL, "
+        "ts REAL NOT NULL, "
+        "up INTEGER NOT NULL)"
     )
     return conn
 
@@ -182,6 +195,31 @@ def tool_docker_logs(args: dict) -> str:
     return c.logs(tail=lines).decode("utf-8", errors="replace")
 
 
+def tool_container_stats(_args: dict) -> str:
+    lines = []
+    for c in docker_client.containers.list():
+        try:
+            s = c.stats(stream=False)
+            cpu_delta = (
+                s["cpu_stats"]["cpu_usage"]["total_usage"]
+                - s["precpu_stats"]["cpu_usage"]["total_usage"]
+            )
+            sys_delta = s["cpu_stats"]["system_cpu_usage"] - s["precpu_stats"]["system_cpu_usage"]
+            n_cpus = s["cpu_stats"].get("online_cpus") or len(
+                s["cpu_stats"]["cpu_usage"].get("percpu_usage") or [1]
+            )
+            cpu_pct = (cpu_delta / sys_delta) * n_cpus * 100 if sys_delta > 0 else 0.0
+            mem_used = s["memory_stats"].get("usage", 0)
+            mem_limit = s["memory_stats"].get("limit", 1) or 1
+            lines.append(
+                f"{c.name}\tcpu={cpu_pct:.1f}%\tmem={mem_used / 1e6:.0f}MB "
+                f"({100 * mem_used / mem_limit:.0f}%)"
+            )
+        except Exception as e:  # noqa: BLE001
+            lines.append(f"{c.name}\terror: {e}")
+    return "\n".join(lines) if lines else "no running containers"
+
+
 def tool_propose_restart(args: dict) -> str:
     name = args.get("container", "")
     try:
@@ -234,6 +272,38 @@ def tool_propose_swap_gpu_config(args: dict) -> str:
     )
 
 
+# Scoped to docker CLI subcommands reachable via the mounted socket. This is a
+# real host-visible escape hatch (container/image/resource inspection) but NOT
+# arbitrary host shell access -- the container has no host filesystem or
+# process namespace beyond what docker itself exposes.
+SHELL_ALLOWLIST = [
+    r"^docker ps( -a)?$",
+    r"^docker stats --no-stream$",
+    r"^docker inspect [a-zA-Z0-9_.\-]+$",
+    r"^docker images$",
+    r"^docker system df$",
+    r"^docker top [a-zA-Z0-9_.\-]+$",
+    r"^docker port [a-zA-Z0-9_.\-]+$",
+    r"^docker logs( --tail \d+)? [a-zA-Z0-9_.\-]+$",
+]
+
+
+def tool_propose_run_shell(args: dict) -> str:
+    cmd = args.get("command", "").strip()
+    if not any(re.match(p, cmd) for p in SHELL_ALLOWLIST):
+        return (
+            f"refusing -- command not in the allowlist: {cmd!r}. Allowed: docker ps[-a], "
+            f"docker stats --no-stream, docker inspect <name>, docker images, docker system df, "
+            f"docker top <name>, docker port <name>, docker logs [--tail N] <name>."
+        )
+    PENDING_CONFIRMATIONS[args["_channel_id"]] = {"action": "run_shell", "command": cmd}
+    return (
+        f"PENDING_CONFIRMATION: proposed running `{cmd}`. A Confirm/Cancel button prompt "
+        f"will be shown to the user separately -- do not ask them to type yes, just briefly "
+        f"note what you're proposing and that it needs their confirmation."
+    )
+
+
 def tool_backup_status(_args: dict) -> str:
     if not os.path.exists(BACKUP_LOG_PATH):
         return f"backup log not found at {BACKUP_LOG_PATH} (mount missing?)"
@@ -274,6 +344,43 @@ def tool_disk_usage(_args: dict) -> str:
     )
 
 
+def tool_token_usage(args: dict) -> str:
+    if not LITELLM_DB_PASSWORD:
+        return "LITELLM_DB_PASSWORD not configured on this bot"
+    days = int(args.get("days") or 7)
+    try:
+        conn = psycopg2.connect(
+            host="litellm-db",
+            dbname="litellm",
+            user="litellm",
+            password=LITELLM_DB_PASSWORD,
+            connect_timeout=5,
+        )
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT COALESCE(v.key_alias, '(unlabeled -- master key or deleted key)') AS alias, "
+                'SUM(s.total_tokens), SUM(s.prompt_tokens), SUM(s.completion_tokens), COUNT(*) '
+                'FROM "LiteLLM_SpendLogs" s '
+                'LEFT JOIN "LiteLLM_VerificationToken" v ON s.api_key = v.token '
+                'WHERE s."startTime" > now() - make_interval(days => %s) '
+                "GROUP BY alias ORDER BY 2 DESC NULLS LAST",
+                (days,),
+            )
+            rows = cur.fetchall()
+        conn.close()
+    except Exception as e:  # noqa: BLE001
+        return f"token usage query failed: {e}"
+    if not rows:
+        return f"no usage recorded in the last {days} day(s)"
+    lines = [f"tokens used, last {days} day(s):"]
+    for alias, total, prompt, completion, calls in rows:
+        lines.append(
+            f"{alias}: {total or 0:,} tokens ({prompt or 0:,} prompt + {completion or 0:,} "
+            f"completion), {calls} calls"
+        )
+    return "\n".join(lines)
+
+
 def tool_unifi_clients(_args: dict) -> str:
     if unifi is None:
         return "UniFi is not configured on this bot"
@@ -301,6 +408,55 @@ def tool_unifi_network_health(_args: dict) -> str:
     for entry in data.get("data", []):
         lines.append(f"{entry.get('subsystem')}: {entry.get('status')} (num_user={entry.get('num_user', '?')})")
     return "\n".join(lines) if lines else "no health data returned"
+
+
+def tool_unifi_topology(_args: dict) -> str:
+    if unifi is None:
+        return "UniFi is not configured on this bot"
+    try:
+        data = unifi.get("stat/device")
+    except Exception as e:  # noqa: BLE001
+        return f"UniFi request failed: {e}"
+    lines = []
+    for d in data.get("data", []):
+        name = d.get("name", d.get("mac"))
+        state = "online" if d.get("state") == 1 else f"state={d.get('state')}"
+        up = d.get("uplink") or {}
+        uplink_desc = (
+            f"-> {up.get('uplink_device_name')} port {up.get('uplink_remote_port')}"
+            if up.get("uplink_device_name")
+            else "(no uplink -- likely the gateway)"
+        )
+        lines.append(f"{name} [{d.get('type', '?')}] {d.get('ip', '?')} {state} {uplink_desc}")
+    return "\n".join(lines) if lines else "no devices returned"
+
+
+def tool_unifi_alerts(_args: dict) -> str:
+    # This console's classic Alarms API (list/alarm, rest/alarm) returned
+    # errors on every path tried, so this is derived from device online
+    # state/last_seen instead of the native Alarms feed -- still genuinely
+    # useful, just labeled honestly.
+    if unifi is None:
+        return "UniFi is not configured on this bot"
+    try:
+        data = unifi.get("stat/device")
+    except Exception as e:  # noqa: BLE001
+        return f"UniFi request failed: {e}"
+    now = time.time()
+    alerts = []
+    for d in data.get("data", []):
+        name = d.get("name", d.get("mac"))
+        if d.get("state") != 1:
+            alerts.append(f"{name}: not online (state={d.get('state')})")
+        last_seen = d.get("last_seen")
+        if last_seen and now - last_seen > 600:
+            alerts.append(f"{name}: last_seen {int((now - last_seen) / 60)}m ago (stale)")
+    if not alerts:
+        return (
+            "no device-level alerts (derived from device online/last_seen state -- this "
+            "controller's native Alarms API isn't reachable from here)"
+        )
+    return "\n".join(alerts)
 
 
 # --------------------------------------------------------- hourly scan -----
@@ -422,6 +578,53 @@ def reconcile_issues(current: dict[str, str]) -> list[str]:
     return new_alerts
 
 
+def record_uptime_snapshot() -> None:
+    """Called once per hourly scan tick. Writes one up/down row per tracked
+    service regardless of whether anything is wrong -- scan_for_issues only
+    records state *transitions*, so this is the only history uptime_report
+    can compute a real percentage from."""
+    conn = db()
+    now = time.time()
+    rows = []
+    gpu_swap_containers = set(GPU_VISION_CONTAINERS) | {GPU_CODER_CONTAINER}
+    for c in docker_client.containers.list(all=True):
+        if c.name in gpu_swap_containers:
+            continue
+        policy = c.attrs.get("HostConfig", {}).get("RestartPolicy", {}).get("Name", "")
+        if policy in ("unless-stopped", "always"):
+            rows.append((f"container:{c.name}", now, 1 if c.status == "running" else 0))
+    vision_up = all(_safe_status(n) == "running" for n in GPU_VISION_CONTAINERS)
+    coder_up = _safe_status(GPU_CODER_CONTAINER) == "running"
+    rows.append(("model:serving", now, 1 if (vision_up or coder_up) else 0))
+    for name, url in HEALTH_ENDPOINTS:
+        try:
+            ok = requests.get(url, timeout=5).status_code < 300
+        except Exception:  # noqa: BLE001
+            ok = False
+        rows.append((f"health:{name}", now, 1 if ok else 0))
+    conn.executemany("INSERT INTO service_checks (service, ts, up) VALUES (?, ?, ?)", rows)
+    conn.commit()
+    conn.close()
+
+
+def tool_uptime_report(args: dict) -> str:
+    days = int(args.get("days") or 7)
+    cutoff = time.time() - days * 86400
+    conn = db()
+    rows = conn.execute(
+        "SELECT service, SUM(up), COUNT(*) FROM service_checks WHERE ts > ? GROUP BY service",
+        (cutoff,),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return f"no uptime data yet for the last {days} day(s) -- samples accumulate hourly going forward"
+    lines = [f"uptime, last {days} day(s), hourly samples:"]
+    for service, up_count, total in sorted(rows, key=lambda r: r[1] / r[2]):
+        pct = 100.0 * up_count / total
+        lines.append(f"{service}: {pct:.1f}% ({up_count}/{total} checks up)")
+    return "\n".join(lines)
+
+
 TOOLS = [
     {
         "type": "function",
@@ -527,6 +730,68 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "container_stats",
+            "description": "Live CPU% and memory usage per running container. Read-only.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "unifi_topology",
+            "description": "List UniFi devices (AP/switch/gateway) with model, IP, online state, and uplink (which device/port they connect to). Read-only.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "unifi_alerts",
+            "description": "Device-level UniFi alerts derived from online state and last_seen staleness. Read-only.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "uptime_report",
+            "description": "Per-service uptime percentage over the last N days, from hourly health samples. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {"days": {"type": "integer", "description": "lookback window, default 7"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "token_usage",
+            "description": "Per-key LLM token usage (prompt/completion/total, call count) over the last N days from LiteLLM's spend log. Tokens only, no dollar spend. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {"days": {"type": "integer", "description": "lookback window, default 7"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_run_shell",
+            "description": (
+                "Propose running an allowlisted docker CLI command (ps, stats, inspect, images, "
+                "system df, top, port, logs) for one-off diagnostics beyond the other tools. Does "
+                "NOT run it -- asks the user to confirm first. Not general host shell access."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string", "description": "exact command, e.g. 'docker ps -a'"}},
+                "required": ["command"],
+            },
+        },
+    },
 ]
 
 TOOL_IMPLS = {
@@ -540,6 +805,12 @@ TOOL_IMPLS = {
     "disk_usage": tool_disk_usage,
     "unifi_clients": tool_unifi_clients,
     "unifi_network_health": tool_unifi_network_health,
+    "container_stats": tool_container_stats,
+    "unifi_topology": tool_unifi_topology,
+    "unifi_alerts": tool_unifi_alerts,
+    "uptime_report": tool_uptime_report,
+    "token_usage": tool_token_usage,
+    "propose_run_shell": tool_propose_run_shell,
 }
 
 # channel_id -> {"action": "restart"|"swap_gpu_config", ...}
@@ -620,6 +891,16 @@ def execute_pending_action(pending: dict) -> str:
     if pending["action"] == "swap_gpu_config":
         return _do_swap_gpu_config(pending["target"])
 
+    if pending["action"] == "run_shell":
+        try:
+            result = subprocess.run(
+                shlex.split(pending["command"]), capture_output=True, text=True, timeout=15
+            )
+            out = (result.stdout + result.stderr).strip()
+            return out[:1800] if out else "(no output)"
+        except Exception as e:  # noqa: BLE001
+            return f"command failed: {e}"
+
     return f"Unknown pending action: {pending['action']}"
 
 
@@ -633,6 +914,9 @@ def build_confirmation_embed(pending: dict) -> discord.Embed:
             f"Swap the active GPU config to **{pending['target']}**? "
             f"This stops the other config's containers first (~1-2 min to load)."
         )
+    elif pending["action"] == "run_shell":
+        title = "Confirm shell command"
+        desc = f"Run `{pending['command']}`?"
     else:
         title = "Confirm action"
         desc = str(pending)
@@ -704,6 +988,7 @@ async def hourly_scan():
     try:
         issues = scan_for_issues()
         alerts = reconcile_issues(issues)
+        record_uptime_snapshot()
     except Exception:  # noqa: BLE001
         log.exception("hourly scan failed")
         return
