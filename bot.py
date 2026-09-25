@@ -190,8 +190,9 @@ def tool_propose_restart(args: dict) -> str:
         return f"no such container: {name}"
     PENDING_CONFIRMATIONS[args["_channel_id"]] = {"action": "restart", "container": name}
     return (
-        f"PENDING_CONFIRMATION: proposed restarting '{name}'. Tell the user to reply "
-        f"'yes' to confirm or anything else to cancel -- do not say it has restarted yet."
+        f"PENDING_CONFIRMATION: proposed restarting '{name}'. A Confirm/Cancel button "
+        f"prompt will be shown to the user separately -- do not ask them to type yes, "
+        f"just briefly note what you're proposing and that it needs their confirmation."
     )
 
 
@@ -227,8 +228,9 @@ def tool_propose_swap_gpu_config(args: dict) -> str:
     PENDING_CONFIRMATIONS[args["_channel_id"]] = {"action": "swap_gpu_config", "target": target}
     return (
         f"PENDING_CONFIRMATION: proposed swapping the GPU config to '{target}' "
-        f"(stops the other config's containers first, ~1-2 min to load). Tell the user to "
-        f"reply 'yes' to confirm or anything else to cancel -- do not say it has swapped yet."
+        f"(stops the other config's containers first, ~1-2 min to load). A Confirm/Cancel "
+        f"button prompt will be shown to the user separately -- do not ask them to type "
+        f"yes, just briefly note what you're proposing and that it needs their confirmation."
     )
 
 
@@ -605,14 +607,7 @@ def _do_swap_gpu_config(target: str) -> str:
         return f"GPU swap failed: {e}"
 
 
-def handle_confirmation(channel_id: str, user_text: str) -> str | None:
-    pending = PENDING_CONFIRMATIONS.get(channel_id)
-    if not pending:
-        return None
-    del PENDING_CONFIRMATIONS[channel_id]
-    if user_text.strip().lower() != "yes":
-        return "Cancelled."
-
+def execute_pending_action(pending: dict) -> str:
     if pending["action"] == "restart":
         name = pending["container"]
         try:
@@ -626,6 +621,74 @@ def handle_confirmation(channel_id: str, user_text: str) -> str | None:
         return _do_swap_gpu_config(pending["target"])
 
     return f"Unknown pending action: {pending['action']}"
+
+
+def build_confirmation_embed(pending: dict) -> discord.Embed:
+    if pending["action"] == "restart":
+        title = "Confirm restart"
+        desc = f"Restart container `{pending['container']}`?"
+    elif pending["action"] == "swap_gpu_config":
+        title = "Confirm GPU config swap"
+        desc = (
+            f"Swap the active GPU config to **{pending['target']}**? "
+            f"This stops the other config's containers first (~1-2 min to load)."
+        )
+    else:
+        title = "Confirm action"
+        desc = str(pending)
+    return discord.Embed(title=title, description=desc, color=discord.Color.orange())
+
+
+class ConfirmView(discord.ui.View):
+    def __init__(self, channel_id: str, pending: dict):
+        super().__init__(timeout=300)
+        self.channel_id = channel_id
+        self.pending = pending
+        self.message: discord.Message | None = None
+
+    async def on_timeout(self) -> None:
+        if PENDING_CONFIRMATIONS.get(self.channel_id) is self.pending:
+            del PENDING_CONFIRMATIONS[self.channel_id]
+        for item in self.children:
+            item.disabled = True
+        if self.message is not None:
+            embed = self.message.embeds[0]
+            embed.color = discord.Color.greyple()
+            embed.set_footer(text="Expired -- no action taken.")
+            try:
+                await self.message.edit(embed=embed, view=self)
+            except Exception:  # noqa: BLE001
+                log.exception("failed to edit expired confirmation message")
+
+    async def _resolve(self, interaction: discord.Interaction, confirmed: bool) -> None:
+        if interaction.user.id != OWNER_ID:
+            await interaction.response.send_message("Not yours to confirm.", ephemeral=True)
+            return
+        if PENDING_CONFIRMATIONS.get(self.channel_id) is not self.pending:
+            await interaction.response.send_message(
+                "This confirmation is no longer active.", ephemeral=True
+            )
+            return
+        del PENDING_CONFIRMATIONS[self.channel_id]
+        self.stop()
+        for item in self.children:
+            item.disabled = True
+
+        result = execute_pending_action(self.pending) if confirmed else "Cancelled."
+        embed = interaction.message.embeds[0]
+        embed.color = discord.Color.green() if confirmed else discord.Color.greyple()
+        embed.description = result
+        embed.set_footer(text="Confirmed" if confirmed else "Cancelled")
+        await interaction.response.edit_message(embed=embed, view=self)
+        save_message(self.channel_id, "assistant", result)
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self._resolve(interaction, confirmed=True)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self._resolve(interaction, confirmed=False)
 
 
 # ------------------------------------------------------------------ discord --
@@ -680,18 +743,20 @@ async def on_message(message: discord.Message):
         return
 
     async with message.channel.typing():
-        confirmation_reply = handle_confirmation(channel_id, text)
-        if confirmation_reply is not None:
-            reply = confirmation_reply
-        else:
-            try:
-                reply = run_agent_turn(channel_id, text)
-            except Exception as e:  # noqa: BLE001
-                log.exception("turn failed")
-                reply = f"Error: {e}"
+        try:
+            reply = run_agent_turn(channel_id, text)
+        except Exception as e:  # noqa: BLE001
+            log.exception("turn failed")
+            reply = f"Error: {e}"
 
     for chunk_start in range(0, len(reply), 1900):
         await message.channel.send(reply[chunk_start : chunk_start + 1900])
+
+    pending = PENDING_CONFIRMATIONS.get(channel_id)
+    if pending is not None:
+        embed = build_confirmation_embed(pending)
+        view = ConfirmView(channel_id, pending)
+        view.message = await message.channel.send(embed=embed, view=view)
 
 
 if __name__ == "__main__":
