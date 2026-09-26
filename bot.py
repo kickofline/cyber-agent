@@ -1037,7 +1037,7 @@ def run_agent_turn(channel_id: str, user_text: str) -> str:
     # a follow-up call made *without* tools can't return a further tool_call,
     # and some models then emit empty content instead of plain text, which
     # used to surface as a bare "(no response)".
-    MAX_TOOL_ROUNDS = 5
+    MAX_TOOL_ROUNDS = 8
     for _ in range(MAX_TOOL_ROUNDS):
         msg = response.choices[0].message
         if not msg.tool_calls:
@@ -1062,8 +1062,20 @@ def run_agent_turn(channel_id: str, user_text: str) -> str:
             model=model, messages=messages, tools=TOOLS, max_tokens=800
         )
 
-    final_text = response.choices[0].message.content or (
-        "(hit the tool-call round limit without a final answer -- try rephrasing)"
+    # Round cap reached without the model settling on a final answer. Rather
+    # than give up, force one more call with tools disabled -- it can no
+    # longer try (and fail) to call another tool, so it has to synthesize
+    # whatever it already gathered into a real reply.
+    messages.append({
+        "role": "user",
+        "content": (
+            "[You've made several tool calls now. Stop calling tools and give the user "
+            "your best answer based on everything you've found so far.]"
+        ),
+    })
+    final_response = ai_client.chat.completions.create(model=model, messages=messages, max_tokens=800)
+    final_text = final_response.choices[0].message.content or (
+        "(could not produce a final answer after several tool calls -- try rephrasing)"
     )
     save_message(channel_id, "assistant", final_text)
     return final_text
