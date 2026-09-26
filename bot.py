@@ -39,7 +39,7 @@ MODEL_FALLBACK_ORDER = os.environ.get(
     "MODEL_FALLBACK_ORDER", "qwen3-coder-next,qwen3-vl-8b,qwen3-8b-ablated"
 ).split(",")
 DB_PATH = os.environ.get("DB_PATH", "/data/history.db")
-MAX_HISTORY_MESSAGES = 20
+MAX_HISTORY_MESSAGES = 6
 
 UNIFI_HOST = os.environ.get("UNIFI_HOST", "")
 UNIFI_USERNAME = os.environ.get("UNIFI_USERNAME", "")
@@ -55,7 +55,7 @@ CERT_HOSTS = os.environ.get(
 LITELLM_DB_PASSWORD = os.environ.get("LITELLM_DB_PASSWORD", "")
 FS_ROOT = os.environ.get("FS_ROOT", "/home/skynet")
 
-SYSTEM_PROMPT = (
+SYSTEM_PROMPT_BASE = (
     "You are cyber-agent, an infra assistant for the Ouachita Cyber / skynet LLM lab. "
     "You run inside a Discord DM. Keep replies short and plain text (no markdown tables). "
     "Read-only tools: docker_status, docker_logs, container_stats, gpu_status, backup_status, "
@@ -72,8 +72,21 @@ SYSTEM_PROMPT = (
     "always propose, never assume it ran. "
     "GPU note: only one of {qwen3-coder-next} or {qwen3-vl-8b + qwen3-8b-ablated} runs at a "
     "time on this box -- if a model call fails, that GPU config may be inactive right now; "
-    "use gpu_status to check, and propose_swap_gpu_config (with confirmation) to change it."
+    "use gpu_status to check, and propose_swap_gpu_config (with confirmation) to change it. "
+    "Below is the full skynet infra reference doc (~/llms.md), read fresh from disk each turn "
+    "so it always reflects the current documented state -- use it as ground truth for anything "
+    "it covers (architecture, gotchas, known issues, secrets locations, credentials use)."
 )
+
+
+def build_system_prompt() -> str:
+    llms_md_path = os.path.join(FS_ROOT, "llms.md")
+    try:
+        with open(llms_md_path, "r", errors="replace") as f:
+            context = f.read()
+    except Exception as e:  # noqa: BLE001
+        return SYSTEM_PROMPT_BASE + f"\n\n[llms.md unavailable: {e}]"
+    return SYSTEM_PROMPT_BASE + "\n\n--- ~/llms.md ---\n" + context
 
 ai_client = OpenAI(base_url=LITELLM_BASE_URL, api_key=LITELLM_API_KEY)
 docker_client = docker_sdk.from_env()
@@ -993,7 +1006,7 @@ PENDING_CONFIRMATIONS: dict[str, dict] = {}
 
 def run_agent_turn(channel_id: str, user_text: str) -> str:
     save_message(channel_id, "user", user_text)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + load_history(channel_id)
+    messages = [{"role": "system", "content": build_system_prompt()}] + load_history(channel_id)
 
     last_error = None
     for model in MODEL_FALLBACK_ORDER:
