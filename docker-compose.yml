@@ -9,10 +9,12 @@ services:
     environment:
       - LITELLM_BASE_URL=http://litellm:4000/v1
       - DB_PATH=/data/history.db
+      - BACKUP_LOG_PATH=/home/skynet/backup-to-shield.log
+      - FS_ROOT=/home/skynet
     volumes:
       - cyber_agent_data:/data
       - /var/run/docker.sock:/var/run/docker.sock
-      - /home/skynet/backup-to-shield.log:/backup-log/backup-to-shield.log:ro
+      - /home/skynet:/home/skynet
     group_add:
       - "988"
     networks:

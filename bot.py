@@ -11,6 +11,7 @@ hostname needed.
 import json
 import logging
 import os
+import pathlib
 import re
 import shlex
 import shutil
@@ -52,17 +53,23 @@ CERT_HOSTS = os.environ.get(
 ).split(",")
 
 LITELLM_DB_PASSWORD = os.environ.get("LITELLM_DB_PASSWORD", "")
+FS_ROOT = os.environ.get("FS_ROOT", "/home/skynet")
 
 SYSTEM_PROMPT = (
     "You are cyber-agent, an infra assistant for the Ouachita Cyber / skynet LLM lab. "
     "You run inside a Discord DM. Keep replies short and plain text (no markdown tables). "
     "Read-only tools: docker_status, docker_logs, container_stats, gpu_status, backup_status, "
     "cert_expiry, disk_usage, uptime_report, token_usage, unifi_clients, unifi_network_health, "
-    "unifi_topology, unifi_alerts. "
-    "Mutating tools (propose_restart, propose_swap_gpu_config, propose_run_shell) never execute "
-    "immediately -- calling one shows the user a Discord Confirm/Cancel button prompt, and only "
-    "clicking Confirm executes it. Do not claim an action succeeded until you have tool output "
-    "showing it did, and never tell the user to type 'yes' -- the buttons handle that. "
+    "unifi_topology, unifi_alerts, fs_read, fs_glob, fs_grep, web_search. "
+    f"fs_read/fs_glob/fs_grep operate on the real skynet filesystem under {FS_ROOT} (bind-mounted "
+    "into this container at the same path) -- that's every stack's config/code/logs. "
+    "Mutating tools (propose_restart, propose_swap_gpu_config, propose_fs_write, propose_run_bash) "
+    "never execute immediately -- calling one shows the user a Discord Confirm/Cancel button "
+    "prompt, and only clicking Confirm executes it. Do not claim an action succeeded until you "
+    "have tool output showing it did, and never tell the user to type 'yes' -- the buttons "
+    "handle that. propose_run_bash is real host-visible bash (sees the mounted filesystem and "
+    "the docker socket, not a sandbox) -- use it for anything the other tools don't cover, but "
+    "always propose, never assume it ran. "
     "GPU note: only one of {qwen3-coder-next} or {qwen3-vl-8b + qwen3-8b-ablated} runs at a "
     "time on this box -- if a model call fails, that GPU config may be inactive right now; "
     "use gpu_status to check, and propose_swap_gpu_config (with confirmation) to change it."
@@ -272,35 +279,113 @@ def tool_propose_swap_gpu_config(args: dict) -> str:
     )
 
 
-# Scoped to docker CLI subcommands reachable via the mounted socket. This is a
-# real host-visible escape hatch (container/image/resource inspection) but NOT
-# arbitrary host shell access -- the container has no host filesystem or
-# process namespace beyond what docker itself exposes.
-SHELL_ALLOWLIST = [
-    r"^docker ps( -a)?$",
-    r"^docker stats --no-stream$",
-    r"^docker inspect [a-zA-Z0-9_.\-]+$",
-    r"^docker images$",
-    r"^docker system df$",
-    r"^docker top [a-zA-Z0-9_.\-]+$",
-    r"^docker port [a-zA-Z0-9_.\-]+$",
-    r"^docker logs( --tail \d+)? [a-zA-Z0-9_.\-]+$",
-]
+
+def tool_fs_read(args: dict) -> str:
+    path = args.get("path", "")
+    try:
+        with open(path, "r", errors="replace") as f:
+            lines = f.readlines()
+    except Exception as e:  # noqa: BLE001
+        return f"could not read {path}: {e}"
+    offset = int(args.get("offset") or 1)
+    limit = int(args.get("limit") or 300)
+    chunk = lines[offset - 1 : offset - 1 + limit]
+    body = "".join(f"{offset + i}:{line}" for i, line in enumerate(chunk))
+    return body[:6000] if body else "(empty range)"
 
 
-def tool_propose_run_shell(args: dict) -> str:
-    cmd = args.get("command", "").strip()
-    if not any(re.match(p, cmd) for p in SHELL_ALLOWLIST):
-        return (
-            f"refusing -- command not in the allowlist: {cmd!r}. Allowed: docker ps[-a], "
-            f"docker stats --no-stream, docker inspect <name>, docker images, docker system df, "
-            f"docker top <name>, docker port <name>, docker logs [--tail N] <name>."
+def tool_fs_glob(args: dict) -> str:
+    pattern = args.get("pattern", "*")
+    root = args.get("root") or FS_ROOT
+    try:
+        matches = sorted(str(p) for p in pathlib.Path(root).glob(pattern))
+    except Exception as e:  # noqa: BLE001
+        return f"glob failed: {e}"
+    if not matches:
+        return "no matches"
+    return f"{len(matches)} match(es):\n" + "\n".join(matches[:200])
+
+
+def tool_fs_grep(args: dict) -> str:
+    pattern = args.get("pattern", "")
+    path = args.get("path") or FS_ROOT
+    try:
+        rx = re.compile(pattern)
+    except re.error as e:
+        return f"bad regex: {e}"
+    hits = []
+    targets = [path] if os.path.isfile(path) else [
+        str(p) for p in pathlib.Path(path).rglob("*") if p.is_file()
+    ]
+    for fpath in targets:
+        try:
+            with open(fpath, "r", errors="replace") as f:
+                for i, line in enumerate(f, start=1):
+                    if rx.search(line):
+                        hits.append(f"{fpath}:{i}:{line.rstrip()}")
+                        if len(hits) >= 200:
+                            break
+        except (OSError, UnicodeDecodeError):
+            continue
+        if len(hits) >= 200:
+            break
+    return "\n".join(hits) if hits else "no matches"
+
+
+def tool_web_search(args: dict) -> str:
+    query = args.get("query", "")
+    try:
+        r = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data={"q": query},
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            timeout=10,
         )
-    PENDING_CONFIRMATIONS[args["_channel_id"]] = {"action": "run_shell", "command": cmd}
+        r.raise_for_status()
+    except Exception as e:  # noqa: BLE001
+        return f"web search failed: {e}"
+    titles = re.findall(r'class="result__a"[^>]*>(.*?)</a>', r.text, re.S)
+    snippets = re.findall(r'class="result__snippet"[^>]*>(.*?)</a>', r.text, re.S)
+    urls = re.findall(r'class="result__url"[^>]*>\s*(.*?)\s*</a>', r.text, re.S)
+
+    def clean(s: str) -> str:
+        return re.sub(r"<[^>]+>", "", s).strip()
+
+    results = []
+    for i in range(min(5, len(titles))):
+        title = clean(titles[i])
+        url = clean(urls[i]) if i < len(urls) else ""
+        snippet = clean(snippets[i]) if i < len(snippets) else ""
+        results.append(f"{title} ({url})\n{snippet}")
+    return "\n\n".join(results) if results else "no results"
+
+
+def tool_propose_fs_write(args: dict) -> str:
+    path = args.get("path", "")
+    content = args.get("content", "")
+    PENDING_CONFIRMATIONS[args["_channel_id"]] = {
+        "action": "fs_write",
+        "path": path,
+        "content": content,
+    }
     return (
-        f"PENDING_CONFIRMATION: proposed running `{cmd}`. A Confirm/Cancel button prompt "
-        f"will be shown to the user separately -- do not ask them to type yes, just briefly "
-        f"note what you're proposing and that it needs their confirmation."
+        f"PENDING_CONFIRMATION: proposed writing {len(content)} byte(s) to `{path}` "
+        f"(will overwrite if it exists). A Confirm/Cancel button prompt will be shown to "
+        f"the user separately -- do not ask them to type yes, just briefly note what "
+        f"you're proposing and that it needs their confirmation."
+    )
+
+
+def tool_propose_run_bash(args: dict) -> str:
+    cmd = args.get("command", "").strip()
+    if not cmd:
+        return "no command given"
+    PENDING_CONFIRMATIONS[args["_channel_id"]] = {"action": "run_bash", "command": cmd}
+    return (
+        f"PENDING_CONFIRMATION: proposed running `{cmd}` (bash, cwd={FS_ROOT}, host-visible "
+        f"via the mounted filesystem and docker socket). A Confirm/Cancel button prompt will "
+        f"be shown to the user separately -- do not ask them to type yes, just briefly note "
+        f"what you're proposing and that it needs their confirmation."
     )
 
 
@@ -779,15 +864,91 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "propose_run_shell",
+            "name": "fs_read",
+            "description": f"Read a text file from the {FS_ROOT} tree on skynet (line-numbered, optional offset/limit). Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "absolute path, e.g. /home/skynet/llm-stack/docker-compose.yml"},
+                    "offset": {"type": "integer", "description": "1-indexed starting line, default 1"},
+                    "limit": {"type": "integer", "description": "max lines to return, default 300"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fs_glob",
+            "description": f"Find files by glob pattern under {FS_ROOT} (or a given root). Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "glob pattern, e.g. '**/*.yml'"},
+                    "root": {"type": "string", "description": f"search root, default {FS_ROOT}"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fs_grep",
+            "description": f"Regex-search a file or directory tree under {FS_ROOT} for a pattern. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "regular expression"},
+                    "path": {"type": "string", "description": f"file or directory, default {FS_ROOT}"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web (DuckDuckGo) and return the top results' titles, URLs, and snippets. Read-only.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_fs_write",
             "description": (
-                "Propose running an allowlisted docker CLI command (ps, stats, inspect, images, "
-                "system df, top, port, logs) for one-off diagnostics beyond the other tools. Does "
-                "NOT run it -- asks the user to confirm first. Not general host shell access."
+                f"Propose writing/overwriting a text file under {FS_ROOT}. Does NOT write it -- "
+                f"asks the user to confirm first."
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"command": {"type": "string", "description": "exact command, e.g. 'docker ps -a'"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string", "description": "full file content"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "propose_run_bash",
+            "description": (
+                f"Propose running a bash command (cwd {FS_ROOT}, sees the mounted skynet "
+                f"filesystem and the docker socket -- real host-visible access, not a sandbox). "
+                f"Does NOT run it -- asks the user to confirm first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
                 "required": ["command"],
             },
         },
@@ -810,7 +971,12 @@ TOOL_IMPLS = {
     "unifi_alerts": tool_unifi_alerts,
     "uptime_report": tool_uptime_report,
     "token_usage": tool_token_usage,
-    "propose_run_shell": tool_propose_run_shell,
+    "fs_read": tool_fs_read,
+    "fs_glob": tool_fs_glob,
+    "fs_grep": tool_fs_grep,
+    "web_search": tool_web_search,
+    "propose_fs_write": tool_propose_fs_write,
+    "propose_run_bash": tool_propose_run_bash,
 }
 
 # channel_id -> {"action": "restart"|"swap_gpu_config", ...}
@@ -891,13 +1057,27 @@ def execute_pending_action(pending: dict) -> str:
     if pending["action"] == "swap_gpu_config":
         return _do_swap_gpu_config(pending["target"])
 
-    if pending["action"] == "run_shell":
+    if pending["action"] == "fs_write":
+        try:
+            path = pending["path"]
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w") as f:
+                f.write(pending["content"])
+            return f"Wrote {len(pending['content'])} byte(s) to '{path}'."
+        except Exception as e:  # noqa: BLE001
+            return f"write to '{pending['path']}' failed: {e}"
+
+    if pending["action"] == "run_bash":
         try:
             result = subprocess.run(
-                shlex.split(pending["command"]), capture_output=True, text=True, timeout=15
+                ["bash", "-c", pending["command"]],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                cwd=FS_ROOT,
             )
             out = (result.stdout + result.stderr).strip()
-            return out[:1800] if out else "(no output)"
+            return out[:1800] if out else f"(no output, exit code {result.returncode})"
         except Exception as e:  # noqa: BLE001
             return f"command failed: {e}"
 
@@ -914,9 +1094,12 @@ def build_confirmation_embed(pending: dict) -> discord.Embed:
             f"Swap the active GPU config to **{pending['target']}**? "
             f"This stops the other config's containers first (~1-2 min to load)."
         )
-    elif pending["action"] == "run_shell":
-        title = "Confirm shell command"
-        desc = f"Run `{pending['command']}`?"
+    elif pending["action"] == "fs_write":
+        title = "Confirm file write"
+        desc = f"Write {len(pending['content'])} byte(s) to `{pending['path']}`? Overwrites if it exists."
+    elif pending["action"] == "run_bash":
+        title = "Confirm bash command"
+        desc = f"Run `{pending['command']}` (cwd `{FS_ROOT}`)?"
     else:
         title = "Confirm action"
         desc = str(pending)
