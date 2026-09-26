@@ -8,6 +8,7 @@ handles this) so there is no webhook, no reverse proxy, and no public
 hostname needed.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -1008,24 +1009,34 @@ def run_agent_turn(channel_id: str, user_text: str) -> str:
     save_message(channel_id, "user", user_text)
     messages = [{"role": "system", "content": build_system_prompt()}] + load_history(channel_id)
 
+    model = None
     last_error = None
-    for model in MODEL_FALLBACK_ORDER:
+    for candidate in MODEL_FALLBACK_ORDER:
         try:
             response = ai_client.chat.completions.create(
-                model=model, messages=messages, tools=TOOLS, max_tokens=800
+                model=candidate, messages=messages, tools=TOOLS, max_tokens=800
             )
+            model = candidate
             break
         except Exception as e:  # noqa: BLE001 - want to try the next model on any failure
             last_error = e
-            log.warning("model %s failed: %s", model, e)
+            log.warning("model %s failed: %s", candidate, e)
     else:
         return f"Every configured model failed to respond (likely the wrong GPU config is active). Last error: {last_error}"
 
-    choice = response.choices[0]
-    msg = choice.message
+    # Multi-round tool-calling loop: some turns need to chain calls (e.g. start
+    # something, then check its status), and every round re-offers `tools` --
+    # a follow-up call made *without* tools can't return a further tool_call,
+    # and some models then emit empty content instead of plain text, which
+    # used to surface as a bare "(no response)".
+    MAX_TOOL_ROUNDS = 5
+    for _ in range(MAX_TOOL_ROUNDS):
+        msg = response.choices[0].message
+        if not msg.tool_calls:
+            final_text = msg.content or "(the model returned nothing and made no tool call)"
+            save_message(channel_id, "assistant", final_text)
+            return final_text
 
-    # Tool-calling loop (single round -- fine for this tool set's shape).
-    if msg.tool_calls:
         messages.append(msg.model_dump(exclude_none=True))
         for call in msg.tool_calls:
             name = call.function.name
@@ -1039,11 +1050,13 @@ def run_agent_turn(channel_id: str, user_text: str) -> str:
             messages.append(
                 {"role": "tool", "tool_call_id": call.id, "content": result[:4000]}
             )
-        followup = ai_client.chat.completions.create(model=model, messages=messages, max_tokens=800)
-        final_text = followup.choices[0].message.content or "(no response)"
-    else:
-        final_text = msg.content or "(no response)"
+        response = ai_client.chat.completions.create(
+            model=model, messages=messages, tools=TOOLS, max_tokens=800
+        )
 
+    final_text = response.choices[0].message.content or (
+        "(hit the tool-call round limit without a final answer -- try rephrasing)"
+    )
     save_message(channel_id, "assistant", final_text)
     return final_text
 
@@ -1176,14 +1189,15 @@ class ConfirmView(discord.ui.View):
         if not confirmed:
             return
 
-        result = execute_pending_action(self.pending)
-        note = (
-            "[The action you just proposed was confirmed via the Discord button and has "
-            f"been executed. Raw result:\n{result}\n\nTell the user what happened in one "
-            "short message, in plain language. If it failed, say so plainly and suggest a "
-            "concrete next step if one is obvious -- do not silently retry.]"
-        )
-        reply = run_agent_turn(self.channel_id, note)
+        async with interaction.channel.typing():
+            result = await asyncio.to_thread(execute_pending_action, self.pending)
+            note = (
+                "[The action you just proposed was confirmed via the Discord button and has "
+                f"been executed. Raw result:\n{result}\n\nTell the user what happened in one "
+                "short message, in plain language. If it failed, say so plainly and suggest a "
+                "concrete next step if one is obvious -- do not silently retry.]"
+            )
+            reply = await asyncio.to_thread(run_agent_turn, self.channel_id, note)
         for chunk_start in range(0, len(reply), 1900):
             await interaction.followup.send(reply[chunk_start : chunk_start + 1900])
 
@@ -1263,7 +1277,7 @@ async def on_message(message: discord.Message):
 
     async with message.channel.typing():
         try:
-            reply = run_agent_turn(channel_id, text)
+            reply = await asyncio.to_thread(run_agent_turn, channel_id, text)
         except Exception as e:  # noqa: BLE001
             log.exception("turn failed")
             reply = f"Error: {e}"
