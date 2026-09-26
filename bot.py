@@ -127,6 +127,14 @@ def save_message(channel_id: str, role: str, content: str) -> None:
     conn.close()
 
 
+def clear_history(channel_id: str) -> int:
+    conn = db()
+    cur = conn.execute("DELETE FROM messages WHERE channel_id = ?", (channel_id,))
+    conn.commit()
+    conn.close()
+    return cur.rowcount
+
+
 # --------------------------------------------------------------- unifi api --
 
 class UniFiSession:
@@ -1141,13 +1149,36 @@ class ConfirmView(discord.ui.View):
         for item in self.children:
             item.disabled = True
 
-        result = execute_pending_action(self.pending) if confirmed else "Cancelled."
         embed = interaction.message.embeds[0]
-        embed.color = discord.Color.green() if confirmed else discord.Color.greyple()
-        embed.description = result
-        embed.set_footer(text="Confirmed" if confirmed else "Cancelled")
+        if confirmed:
+            embed.color = discord.Color.green()
+            embed.description = "Confirmed -- executing..."
+            embed.set_footer(text="Confirmed")
+        else:
+            embed.color = discord.Color.greyple()
+            embed.description = "Cancelled."
+            embed.set_footer(text="Cancelled")
         await interaction.response.edit_message(embed=embed, view=self)
-        save_message(self.channel_id, "assistant", result)
+
+        if not confirmed:
+            return
+
+        result = execute_pending_action(self.pending)
+        note = (
+            "[The action you just proposed was confirmed via the Discord button and has "
+            f"been executed. Raw result:\n{result}\n\nTell the user what happened in one "
+            "short message, in plain language. If it failed, say so plainly and suggest a "
+            "concrete next step if one is obvious -- do not silently retry.]"
+        )
+        reply = run_agent_turn(self.channel_id, note)
+        for chunk_start in range(0, len(reply), 1900):
+            await interaction.followup.send(reply[chunk_start : chunk_start + 1900])
+
+        pending = PENDING_CONFIRMATIONS.get(self.channel_id)
+        if pending is not None:
+            new_embed = build_confirmation_embed(pending)
+            new_view = ConfirmView(self.channel_id, pending)
+            new_view.message = await interaction.followup.send(embed=new_embed, view=new_view)
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
     async def confirm(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
@@ -1209,6 +1240,13 @@ async def on_message(message: discord.Message):
     text = message.content.strip()
     if not text:
         return
+
+    if text.lower() in ("/clear", "!clear"):
+        n = clear_history(channel_id)
+        PENDING_CONFIRMATIONS.pop(channel_id, None)
+        await message.channel.send(f"Cleared {n} message(s) of context. Starting fresh.")
+        return
+
 
     async with message.channel.typing():
         try:
