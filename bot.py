@@ -593,6 +593,39 @@ def _safe_status(container_name: str) -> str:
         return "missing"
 
 
+LOG_ERROR_PATTERN = re.compile(r"\b(ERROR|CRITICAL|FATAL|Traceback|Exception)\b")
+LOG_SCAN_TAIL_LINES = 50
+# vLLM containers are excluded: only one GPU config is ever running by design
+# (the other's absence is already covered by the dedicated GPU check below,
+# not a log-content signal), and their startup banners are extremely noisy.
+# cyber-agent's own container is excluded too -- its INFO-level tool-call
+# logging isn't a signal about itself.
+LOG_SCAN_EXCLUDE = set(GPU_VISION_CONTAINERS) | {GPU_CODER_CONTAINER, "cyber-agent"}
+
+
+def _scan_container_logs() -> dict[str, str]:
+    """Grep each running container's recent output for error-shaped lines.
+    Catches containers that are technically 'running' per Docker but silently
+    degraded (stuck retry loop, unhandled exception) -- something none of the
+    other checks (container state, health endpoints) would notice."""
+    found: dict[str, str] = {}
+    for c in docker_client.containers.list():
+        if c.name in LOG_SCAN_EXCLUDE:
+            continue
+        try:
+            tail = c.logs(tail=LOG_SCAN_TAIL_LINES).decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            continue
+        matches = [
+            line
+            for line in tail.splitlines()
+            if LOG_ERROR_PATTERN.search(line) and "Exception ignored in" not in line
+        ]
+        if matches:
+            found[f"logs:{c.name}"] = f"{c.name}: {matches[-1][:200]}"
+    return found
+
+
 def scan_for_issues() -> dict[str, str]:
     """Run every check once; return {issue_key: human description} for
     whatever is currently wrong. Empty dict == all clear."""
@@ -635,6 +668,10 @@ def scan_for_issues() -> dict[str, str]:
                 issues[f"health:{name}"] = f"{name} health check returned HTTP {r.status_code}"
         except Exception as e:  # noqa: BLE001
             issues[f"health:{name}"] = f"{name} health check failed: {e}"
+
+    # log content -- catches a container that's "running" per Docker/health
+    # checks but silently degraded (retry loop, unhandled exception).
+    issues.update(_scan_container_logs())
 
     # cert expiry (<14 days, or unreachable)
     for line in tool_cert_expiry({}).splitlines():
@@ -1244,6 +1281,40 @@ intents.dm_messages = True
 client = discord.Client(intents=intents)
 
 
+SCAN_INVESTIGATION_CHANNEL = "hourly-scan-investigation"
+
+
+async def investigate_and_alert(alerts: list[str]) -> None:
+    """Findings from scan_for_issues() are raw and can be noise (e.g. a
+    benign shutdown-artifact traceback). Before DMing the owner, let the
+    agent investigate with its normal tools (docker_logs, docker_status,
+    fs_read, etc.) and decide what's actually worth a DM -- and write the
+    message itself, with real context, instead of a raw finding dump."""
+    clear_history(SCAN_INVESTIGATION_CHANNEL)
+    note = (
+        "[Automated hourly scan found what look like new infra issues, listed below. "
+        "Before alerting the owner, investigate each one with your tools (docker_logs, "
+        "docker_status, fs_read, etc.) to check whether it's a REAL ongoing problem or "
+        "just noise (e.g. a benign restart/shutdown artifact, something already resolved "
+        "since the scan ran). Then write the DM you'd actually want the owner to see: "
+        "drop or clearly downgrade anything that isn't a real problem, and give useful "
+        "context (likely cause, suggested next step) for anything real. "
+        "If NOTHING here is worth telling the owner about, respond with exactly "
+        "NO_ALERT_NEEDED and nothing else.\n\nRaw findings:\n"
+        + "\n".join(f"- {a}" for a in alerts)
+        + "]"
+    )
+    reply = await asyncio.to_thread(run_agent_turn, SCAN_INVESTIGATION_CHANNEL, note)
+    if reply.strip().strip('"').upper().startswith("NO_ALERT_NEEDED"):
+        log.info(
+            "hourly scan: investigated %d finding(s), none worth alerting on", len(alerts)
+        )
+        return
+    user = await client.fetch_user(OWNER_ID)
+    for chunk_start in range(0, len(reply), 1900):
+        await user.send(reply[chunk_start : chunk_start + 1900])
+
+
 @tasks.loop(hours=1)
 async def hourly_scan():
     try:
@@ -1256,14 +1327,11 @@ async def hourly_scan():
     if not alerts:
         log.info("hourly scan: all clear")
         return
-    log.info("hourly scan: %d new issue(s)", len(alerts))
+    log.info("hourly scan: %d new issue(s), investigating before alerting", len(alerts))
     try:
-        user = await client.fetch_user(OWNER_ID)
-        text = "cyber-agent hourly scan found new issues:\n" + "\n".join(f"- {a}" for a in alerts)
-        for chunk_start in range(0, len(text), 1900):
-            await user.send(text[chunk_start : chunk_start + 1900])
+        await investigate_and_alert(alerts)
     except Exception:  # noqa: BLE001
-        log.exception("failed to DM owner about new issues")
+        log.exception("failed to investigate/DM owner about new issues")
 
 
 @client.event
